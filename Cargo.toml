@@ -1,0 +1,15 @@
+[package]
+name = "stun3489"
+version = "0.1.0"
+authors = ["Manuel Schölling <manuel.schoelling@gmx.de>"]
+homepage = "https://github.com/manuels/stun3489"
+description = "An implementation of STUN (RFC 3489) using tokio"
+license = "GPL-2.0"
+
+[dependencies]
+byteorder = "1.0.0"
+futures = "0.1.14"
+tokio-core = "0.1.8"
+ring = "0.11.0"
+rand = "0.3.15"
+
