@@ -162,7 +162,7 @@ pub fn stun3489(addr: SocketAddr, stun_server: SocketAddr, handle: &Handle, time
                 request3.and_then(move |response| {
                     //println!("response3={:?}", response);
                     if let Some(Response::Bind(response)) = response {
-                        if public_addr.ip() == response.mapped_address.ip() {
+                        if public_addr.ip() != response.mapped_address.ip() {
                             return ok(Connection::SymmetricNat).boxed();
                         }
 
