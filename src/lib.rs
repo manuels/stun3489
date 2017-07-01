@@ -35,12 +35,12 @@ use timeout::IntoTimeoutFuture;
 
 #[derive(Debug, PartialEq)]
 pub enum Connection {
-    OpenInternet,
-    FullConeNat,
+    OpenInternet(SocketAddr),
+    FullConeNat(SocketAddr),
     SymmetricNat,
-    RestrictedPortNat,
-    RestrictedConeNat,
-    SymmetricFirewall,
+    RestrictedPortNat(SocketAddr),
+    RestrictedConeNat(SocketAddr),
+    SymmetricFirewall(SocketAddr),
     UdpBlocked,
 }
 
@@ -138,38 +138,39 @@ pub fn stun3489(addr: SocketAddr, stun_server: SocketAddr, handle: &Handle, time
     let result = request1.and_then(move |response| {
         //println!("response1={:?}", response);
         if let Some(Response::Bind(response)) = response {
-            if addr.ip() == response.mapped_address.ip() {
+            let public_addr = response.mapped_address;
+
+            if addr.ip() == public_addr.ip() {
                 // No NAT
                 return request2.and_then(move |response| {
                     println!("response2a={:?}", response);
                     if response.is_some() {
-                        return ok(Connection::OpenInternet).boxed();
+                        return ok(Connection::OpenInternet(public_addr)).boxed();
                     } else {
-                        return ok(Connection::SymmetricFirewall).boxed();
+                        return ok(Connection::SymmetricFirewall(public_addr)).boxed();
                     }
                 }).boxed()
             }
 
             // NAT detected
-            let public_ip = response.mapped_address.ip();
             request2.and_then(move |response| {
                 //println!("response2b={:?}", response);
                 if response.is_some() {
-                    return ok(Connection::FullConeNat).boxed();
+                    return ok(Connection::FullConeNat(public_addr)).boxed();
                 }
 
                 request3.and_then(move |response| {
                     //println!("response3={:?}", response);
                     if let Some(Response::Bind(response)) = response {
-                        if public_ip == response.mapped_address.ip() {
+                        if public_addr.ip() == response.mapped_address.ip() {
                             return ok(Connection::SymmetricNat).boxed();
                         }
 
                         request4.and_then(move |response| {
                             if response.is_some() {
-                                ok(Connection::RestrictedConeNat).boxed()
+                                ok(Connection::RestrictedConeNat(public_addr)).boxed()
                             } else {
-                                ok(Connection::RestrictedPortNat).boxed()
+                                ok(Connection::RestrictedPortNat(public_addr)).boxed()
                             }
                         }).or_else(unreachable_to_udp_blocked).boxed()
                     } else {

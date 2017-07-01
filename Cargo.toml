@@ -1,6 +1,6 @@
 [package]
 name = "stun3489"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Manuel Schölling <manuel.schoelling@gmx.de>"]
 homepage = "https://github.com/manuels/stun3489"
 description = "An implementation of STUN (RFC 3489) using tokio"
