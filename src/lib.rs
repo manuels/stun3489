@@ -12,43 +12,24 @@ use std::io;
 use std::io::Error;
 use std::io::Result;
 use std::io::ErrorKind;
-use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::time::Duration;
-use std::rc::Rc;
-use std::error::Error as Err;
 
 use rand::Rng;
-
-use mio::Evented;
-use mio::Registration;
-use mio::SetReadiness;
 
 use tokio_core::net::UdpCodec;
 use tokio_core::net::UdpSocket;
 use tokio_core::reactor::Handle;
 use tokio_core::reactor::Timeout;
-use tokio_core::reactor::PollEvented;
 
 use futures::stream::Stream;
-use futures::stream::BoxStream;
 use futures::sink::Sink;
-use futures::sink::BoxSink;
 use futures::IntoFuture;
-use futures::sync::mpsc::channel;
-use futures::sync::mpsc::Sender;
-use futures::sync::mpsc::Receiver;
-
-use std::sync::Arc;
-use std::sync::Mutex;
 
 use futures::Future;
 use futures::Flatten;
-use futures::BoxFuture;
 use futures::Poll;
 use futures::Async;
-use futures::AsyncSink;
-use futures::StartSend;
 use futures::future::FutureResult;
 use futures::future::ok;
 use futures::future::err;
@@ -82,13 +63,10 @@ impl Into<Option<SocketAddr>> for Connectivity {
     }
 }
 
-type IoStream<T> = BoxStream<T, Error>;
-type IoSink<T> = BoxSink<T, Error>;
-
-struct Request {
+struct Request<S,T> {
     id:      u64,
-    stream:  Option<IoStream<(Vec<u8>, SocketAddr)>>,
-    sink:    Option<IoSink<(Vec<u8>, SocketAddr)>>,
+    sink:    Option<S>,
+    stream:  Option<T>,
     codec:   codec::StunCodec,
     addr:    SocketAddr,
     sent:    bool,
@@ -96,9 +74,12 @@ struct Request {
     timeout: Flatten<FutureResult<Timeout, Error>>,
 }
 
-impl Request {
-    fn new(stream:  IoStream<(Vec<u8>, SocketAddr)>,
-           sink:    IoSink<(Vec<u8>, SocketAddr)>,
+impl<S,T> Request<S,T>
+    where S: Sink<SinkItem=(Vec<u8>, SocketAddr), SinkError=io::Error>,
+          T: Stream<Item=(Vec<u8>, SocketAddr), Error=io::Error>
+{
+    fn new(sink:    S,
+           stream:  T,
            dst:     SocketAddr,
            request: codec::Request,
            timeout: Result<Timeout>)
@@ -107,8 +88,8 @@ impl Request {
         let mut rng = rand::thread_rng();
 
         Request {
-            stream:  Some(stream),
             sink:    Some(sink),
+            stream:  Some(stream),
             addr:    dst,
             request: request,
             timeout: timeout.into_future().flatten(),
@@ -118,21 +99,23 @@ impl Request {
         }
     }
 
-    pub fn mut_sink(&mut self) -> &mut IoSink<(Vec<u8>, SocketAddr)> {
+    pub fn mut_sink(&mut self) -> &mut S {
         self.sink.as_mut().expect("Attempted Request::mut_sink after completion")
     }
 
-    pub fn mut_stream(&mut self) -> &mut IoStream<(Vec<u8>, SocketAddr)> {
+    pub fn mut_stream(&mut self) -> &mut T {
         self.stream.as_mut().expect("Attempted Request::mut_stream after completion")
     }
 }
 
-impl Future for Request {
-    type Item = (IoStream<(Vec<u8>, SocketAddr)>, IoSink<(Vec<u8>, SocketAddr)>, Option<Response>);
-    type Error = (IoStream<(Vec<u8>, SocketAddr)>, IoSink<(Vec<u8>, SocketAddr)>, io::Error);
+impl<S,T> Future for Request<S,T>
+    where S: Sink<SinkItem=(Vec<u8>, SocketAddr), SinkError=io::Error>,
+          T: Stream<Item=(Vec<u8>, SocketAddr), Error=io::Error>
+{
+    type Item = (S, T, Option<Response>);
+    type Error = (S, T, io::Error);
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-
         if !self.sent {
             let msg = (self.id, self.addr, self.request.clone());
 
@@ -148,8 +131,8 @@ impl Future for Request {
                     self.sent = true;
                 },
                 Ok(Async::NotReady) => (),
-                Err(e) => return Err((self.stream.take().unwrap(),
-                                      self.sink.take().unwrap(),
+                Err(e) => return Err((self.sink.take().unwrap(),
+                                      self.stream.take().unwrap(),
                                       e)),
             }
         }
@@ -157,19 +140,19 @@ impl Future for Request {
         loop {
             match self.mut_stream().poll() {
                 Ok(Async::NotReady) => break,
-                Err(e) => return Err((self.stream.take().unwrap(),
-                                      self.sink.take().unwrap(),
+                Err(e) => return Err((self.sink.take().unwrap(),
+                                      self.stream.take().unwrap(),
                                       e)),
                 Ok(Async::Ready(None)) => {
-                    return Ok(Async::Ready((self.stream.take().unwrap(),
-                                            self.sink.take().unwrap(),
+                    return Ok(Async::Ready((self.sink.take().unwrap(),
+                                            self.stream.take().unwrap(),
                                             None)));
                 },
                 Ok(Async::Ready(Some((buf, src)))) => {
                     if let Ok((id, response)) = self.codec.decode(&src, &buf[..]) {
                         if self.id == id {
-                            return Ok(Async::Ready((self.stream.take().unwrap(),
-                                                    self.sink.take().unwrap(),
+                            return Ok(Async::Ready((self.sink.take().unwrap(),
+                                                    self.stream.take().unwrap(),
                                                     Some(response))));
                         }
                     }
@@ -179,13 +162,13 @@ impl Future for Request {
         }
 
         match self.timeout.poll() {
-                Err(e) => return Err((self.stream.take().unwrap(),
-                                      self.sink.take().unwrap(),
+                Err(e) => return Err((self.sink.take().unwrap(),
+                                      self.stream.take().unwrap(),
                                       e)),
                 Ok(Async::NotReady) => (),
                 Ok(Async::Ready(_)) => {
-                    return Ok(Async::Ready((self.stream.take().unwrap(),
-                                            self.sink.take().unwrap(),
+                    return Ok(Async::Ready((self.sink.take().unwrap(),
+                                            self.stream.take().unwrap(),
                                             None)));
                 }
         }
@@ -194,17 +177,19 @@ impl Future for Request {
     }
 }
 
-fn unreachable_to_udp_blocked(tuple: (IoStream<(Vec<u8>, SocketAddr)>, IoSink<(Vec<u8>, SocketAddr)>, Error)) ->
-    BoxFuture<(IoStream<(Vec<u8>, SocketAddr)>, IoSink<(Vec<u8>, SocketAddr)>, Connectivity),
-              (IoStream<(Vec<u8>, SocketAddr)>, IoSink<(Vec<u8>, SocketAddr)>, Error)>
+fn unreachable_to_udp_blocked<S,T>(tuple: (S, T, Error)) ->
+    Box<Future<Item=(S, T, Connectivity),
+               Error=(S, T, Error)>>
+    where S: Sink<SinkItem=(Vec<u8>, SocketAddr), SinkError=io::Error> + 'static,
+          T: Stream<Item=(Vec<u8>, SocketAddr), Error=io::Error> + 'static
 {
-    let (stream, sink, e) = tuple;
+    let (sink, stream, e) = tuple;
 
     if e.raw_os_error() == Some(101) {
         // Network unreachable
-        ok((stream, sink, Connectivity::UdpBlocked)).boxed()
+        Box::new(ok((sink, stream, Connectivity::UdpBlocked)))
     } else {
-        err((stream, sink, e)).boxed()
+        Box::new(err((sink, stream, e)))
     }
 }
 
@@ -228,147 +213,107 @@ pub fn stun3489(bind_addr: SocketAddr,
                 stun_server: SocketAddr,
                 handle: &Handle,
                 timeout: Duration)
-    -> BoxFuture<Connectivity, io::Error>
+    -> Box<Future<Item=Connectivity, Error=io::Error>>
 {
     let sock = match UdpSocket::bind(&bind_addr.clone(), handle) {
         Ok(s) => s,
-        Err(e) => return err(e).boxed(),
+        Err(e) => return Box::new(err(e)),
     };
 
     let bind_addr = match sock.local_addr() {
         Ok(a) => a,
-        Err(e) => return err(e).boxed(),
+        Err(e) => return Box::new(err(e)),
     };
 
     let (sink, stream) = sock.framed(Codec).split();
 
-    stun3489_generic(stream.boxed(), Box::new(sink), bind_addr, stun_server, handle, timeout)
+    Box::new(stun3489_generic(Box::new(sink), stream.boxed(), bind_addr, stun_server, handle, timeout)
         .map(|(_,_,c)| c)
-        .map_err(|(_,_,e)| e)
-        .boxed()
+        .map_err(|(_,_,e)| e))
 }
 
+type ConnectivityFuture<S,T> = Box<Future<Item=(S, T, Connectivity),
+                                          Error=(S, T, io::Error)>>;
 
-pub fn stun3489_generic(stream: IoStream<(Vec<u8>, SocketAddr)>,
-                        sink: IoSink<(Vec<u8>, SocketAddr)>,
+pub fn stun3489_generic<S,T>(sink: S,
+                        stream: T,
                         bind_addr: SocketAddr,
                         stun_server: SocketAddr,
                         handle: &Handle,
                         timeout: Duration)
-    -> BoxFuture<(IoStream<(Vec<u8>, SocketAddr)>, IoSink<(Vec<u8>, SocketAddr)>, Connectivity),
-                 (IoStream<(Vec<u8>, SocketAddr)>, IoSink<(Vec<u8>, SocketAddr)>, io::Error)>
+    -> ConnectivityFuture<S,T>
+    where S: Sink<SinkItem=(Vec<u8>, SocketAddr), SinkError=io::Error> + 'static,
+          T: Stream<Item=(Vec<u8>, SocketAddr), Error=io::Error> + 'static
 {
     let req = codec::Request::Bind(BindRequest::default());
     let req_same_ip_same_port = req.clone();
     let req_same_ip_diff_port = codec::Request::Bind(BindRequest { change_request: Some(ChangeRequest::Port), ..BindRequest::default() });
     let req_diff_ip_diff_port = codec::Request::Bind(BindRequest { change_request: Some(ChangeRequest::IpAndPort), ..BindRequest::default() });
 
-    let timeout1 = Timeout::new(timeout, handle);
-    let timeout2 = Timeout::new(timeout, handle);
-    let timeout3 = Timeout::new(timeout, handle);
-    let timeout4 = Timeout::new(timeout, handle);
+    let halt = Timeout::new(timeout, handle);
+    let handle = handle.clone();
 
-    let request1 = Request::new(stream, sink, stun_server.clone(), req, timeout1);
+    let request1 = Request::new(sink, stream, stun_server.clone(), req, halt);
 
-    let result = request1.and_then(move |(stream, sink, response)| {
+    let result = request1.and_then(move |(sink, stream, response)| {
         //println!("response1={:?}", response);
         if let Some(Response::Bind(response)) = response {
-            let request2 = Request::new(stream, sink, stun_server.clone(), req_diff_ip_diff_port, timeout2);
+            let halt = Timeout::new(timeout, &handle);
+            let request2 = Request::new(sink, stream, stun_server.clone(), req_diff_ip_diff_port, halt);
 
             let public_addr = response.mapped_address;
 
             if bind_addr.ip() == public_addr.ip() {
                 // No NAT
-                return request2.and_then(move |(stream, sink, response)| {
+                return Box::new(request2.and_then(move |(sink, stream, response)| {
                     //println!("response2a={:?}", response);
                     if response.is_some() {
-                        return ok((stream, sink, Connectivity::OpenInternet(public_addr))).boxed();
+                        return Box::new(ok((sink, stream, Connectivity::OpenInternet(public_addr))));
                     } else {
-                        return ok((stream, sink, Connectivity::SymmetricFirewall(public_addr))).boxed();
+                        return Box::new(ok((sink, stream, Connectivity::SymmetricFirewall(public_addr))));
                     }
-                 }).boxed()
+                 })) as ConnectivityFuture<S,T>
             }
 
-             // NAT detected
-            request2.and_then(move |(stream, sink, response)| {
+            // NAT detected
+            Box::new(request2.and_then(move |(sink, stream, response)| {
                 //println!("response2b={:?}", response);
                 if response.is_some() {
-                    return ok((stream, sink, Connectivity::FullConeNat(public_addr))).boxed();
+                    return Box::new(ok((sink, stream, Connectivity::FullConeNat(public_addr)))) as ConnectivityFuture<S,T>;
                 }
 
-                let request3 = Request::new(stream, sink, stun_server.clone(), req_same_ip_same_port, timeout3);
-                request3.and_then(move |(stream, sink, response)| {
+                let halt = Timeout::new(timeout, &handle);
+                let request3 = Request::new(sink, stream, stun_server.clone(), req_same_ip_same_port, halt);
+                Box::new(request3.and_then(move |(sink, stream, response)| {
                     //println!("response3={:?}", response);
                     if let Some(Response::Bind(response)) = response {
                         if public_addr.ip() != response.mapped_address.ip() {
-                            return ok((stream, sink, Connectivity::SymmetricNat)).boxed();
+                            return Box::new(ok((sink, stream, Connectivity::SymmetricNat))) as ConnectivityFuture<S,T>;
                         }
 
-                        let request4 = Request::new(stream, sink, stun_server.clone(), req_same_ip_diff_port, timeout4);
-                        request4.and_then(move |(stream, sink, response)| {
+                        let halt = Timeout::new(timeout, &handle);
+                        let request4 = Request::new(sink, stream, stun_server.clone(), req_same_ip_diff_port, halt);
+                        Box::new(request4.and_then(move |(sink, stream, response)| {
                             if response.is_some() {
-                                ok((stream, sink, Connectivity::RestrictedConeNat(public_addr))).boxed()
+                                Box::new(ok((sink, stream, Connectivity::RestrictedConeNat(public_addr))))
                             } else {
-                                ok((stream, sink, Connectivity::RestrictedPortNat(public_addr))).boxed()
+                                Box::new(ok((sink, stream, Connectivity::RestrictedPortNat(public_addr))))
                             }
-                        }).or_else(unreachable_to_udp_blocked).boxed()
+                        }).or_else(unreachable_to_udp_blocked)) as ConnectivityFuture<S,T>
                     } else {
                          let msg = format!("Did not receive Some(BindResponse) but got {:?} instead!", response);
-                        err((stream, sink, Error::new(ErrorKind::InvalidData, msg))).boxed()
+                        Box::new(err((sink, stream, Error::new(ErrorKind::InvalidData, msg)))) as ConnectivityFuture<S,T>
                     }
-                }).or_else(unreachable_to_udp_blocked).boxed()
-            }).or_else(unreachable_to_udp_blocked).boxed()
+                }).or_else(unreachable_to_udp_blocked)) as ConnectivityFuture<S,T>
+            }).or_else(unreachable_to_udp_blocked)) as ConnectivityFuture<S,T>
          } else {
-             ok((stream, sink, Connectivity::UdpBlocked)).boxed()
+             Box::new(ok((sink, stream, Connectivity::UdpBlocked))) as ConnectivityFuture<S,T>
          }
     }).or_else(unreachable_to_udp_blocked);
 
-    result.boxed()
+    Box::new(result)
 }
 
-/*
-#[derive(Clone)]
-pub struct Stun3489 {
-    sink_private: Sender<(Vec<u8>, SocketAddr)>,
-    sink_public: Sender<(Vec<u8>, SocketAddr)>,
-    stream_private: Arc<IoStream<(Vec<u8>, SocketAddr)>>,
-    stream_public: Arc<Receiver<(Vec<u8>, SocketAddr)>>,
-}
-
-impl Stun3489 {
-    pub fn new(handle: Handle, stream: IoStream<(Vec<u8>, SocketAddr)>, sink: IoSink) -> Stun3489 {
-        let (sink_a, stream_b) = channel(1024);
-        let (sink_b, stream_a) = channel(1024);
-
-        let stream_b = stream_b.map_err(|_| Error::new(ErrorKind::Other, "Undefined channel() error"));
-
-        Stun3489 {
-            sink_public: sink_a,
-            sink_private: sink_b,
-            stream_public: Arc::new(stream_a),
-            stream_private: Arc::new(stream_b.boxed()),
-        }
-    }
-
-    fn sink(&mut self) -> Sender<(Vec<u8>, SocketAddr)> {
-        self.sink_public.clone()
-    }
-
-    fn stream(&mut self) -> Arc<Receiver<(Vec<u8>, SocketAddr)>> {
-        self.stream_public.clone()
-    }
-
-    pub fn detect(&mut self, addr: SocketAddr, stun_server: SocketAddr,
-                  handle: &Handle, timeout: Duration) -> BoxFuture<Connectivity, io::Error> {
-        let stream = self.stream_private.clone();
-        let sink = self.sink_private.clone();
-
-        let sink = sink.sink_map_err(|e| Error::new(ErrorKind::Other, e.description()));
-
-        stun3489_generic(stream, Box::new(sink), addr, stun_server, handle, timeout)
-    }
-}
-*/
 
 #[cfg(test)]
 mod tests {

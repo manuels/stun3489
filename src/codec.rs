@@ -94,7 +94,7 @@ impl StunCodec {
         StunCodec {}
     }
 
-    fn read_binding_response(msg: &[u8], mut c: &mut Cursor<&[u8]>) -> Result<BindResponse> {
+    fn read_binding_response(msg: &[u8], c: &mut Cursor<&[u8]>) -> Result<BindResponse> {
         let mut mapped_address = None;
         let mut source_address = None;
         let mut changed_address = None;
