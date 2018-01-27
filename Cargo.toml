@@ -1,6 +1,6 @@
 [package]
 name = "stun3489"
-version = "0.3.0"
+version = "0.4.0"
 authors = ["Manuel Schölling <manuel.schoelling@gmx.de>"]
 homepage = "https://github.com/manuels/stun3489"
 description = "An implementation of STUN (RFC 3489) using tokio"
@@ -8,9 +8,9 @@ license = "GPL-2.0"
 
 [dependencies]
 byteorder = "1.0.0"
-futures-await = { git = 'https://github.com/alexcrichton/futures-await' }
+futures-await = "0.1.0"
 tokio-core = "0.1.8"
+tokio-timer = "0.1.2"
 ring = "0.11.0"
 rand = "0.3.15"
-log = "*"
-
+log = "0.4.1"

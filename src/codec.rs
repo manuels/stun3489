@@ -25,17 +25,24 @@ pub enum Request {
     SharedSecret, //(SharedSecretRequestMsg),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ChangeRequest {
+    None,
     Ip,
     Port,
     IpAndPort,
 }
 
+impl Default for ChangeRequest {
+    fn default() -> Self {
+        ChangeRequest::None
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct BindRequest {
     pub response_address: Option<SocketAddr>,
-    pub change_request: Option<ChangeRequest>,
+    pub change_request: ChangeRequest,
     pub username: Option<Vec<u8>>,
 }
 
@@ -47,8 +54,9 @@ impl BindRequest {
             Attribute::ResponseAddress(a).encode(&mut buf)?;
         }
 
-        if let Some(ref r) = self.change_request {
-            Attribute::ChangeRequest(r.clone()).encode(&mut buf)?;
+        if self.change_request != ChangeRequest::None {
+            let r = self.change_request.clone();
+            Attribute::ChangeRequest(r).encode(&mut buf)?;
         }
 
         if let Some(ref u) = self.username {
@@ -223,6 +231,7 @@ impl Attribute {
         let mut buf = Vec::with_capacity(4);
 
         match *c {
+            ChangeRequest::None      => (),
             ChangeRequest::Ip        => buf.write_u32::<NetworkEndian>(CHANGE_REQUEST_IP)?,
             ChangeRequest::Port      => buf.write_u32::<NetworkEndian>(CHANGE_REQUEST_PORT)?,
             ChangeRequest::IpAndPort => buf.write_u32::<NetworkEndian>(CHANGE_REQUEST_IP_AND_PORT)?,
@@ -270,64 +279,72 @@ const CHANGE_REQUEST_IP:u32          = 0x20;
 const CHANGE_REQUEST_PORT:u32        = 0x40;
 const CHANGE_REQUEST_IP_AND_PORT:u32 = 0x60;
 
+pub fn encode(msg: (SocketAddr, u64, Request), buf: &mut Vec<u8>) -> SocketAddr {
+    let (dst, trans_id, req) = msg;
+
+    let (typ, m) = match req {
+        Request::Bind(bind) => (BINDING_REQUEST, bind.encode().unwrap()),
+        _ => unimplemented!(),
+    };
+
+    buf.write_u16::<NetworkEndian>(typ).unwrap();
+//        buf.write_u16::<NetworkEndian>(m.len() as u16 + 24).unwrap();
+    buf.write_u16::<NetworkEndian>(m.len() as u16).unwrap();
+    buf.write_u64::<NetworkEndian>(0x0).unwrap();
+    buf.write_u64::<NetworkEndian>(trans_id).unwrap();
+    buf.write_all(&m[..]).unwrap();
+
+    /*
+        TODO
+    let mut copy = buf.clone();
+    while copy.len() % 64 != 0 {
+        copy.write_u8(0).unwrap();
+    }
+    println!("{}", copy.len());
+
+    let mut hash = [0; 20];
+    let digest = digest::digest(&digest::SHA1, &copy[..]);
+    hash.copy_from_slice(digest.as_ref());
+    let message_integrity = Attribute::MessageIntegrity(hash);
+    message_integrity.encode(buf).unwrap();
+        */
+
+    dst
+}
+
+pub fn decode(msg: &[u8]) -> Result<(u64, Response)> {
+    let mut c = Cursor::new(msg);
+
+    let msg_type = c.read_u16::<NetworkEndian>()?;
+    let _ = c.read_u16::<NetworkEndian>()?; // msg_len
+    let trans_id1 = c.read_u64::<NetworkEndian>()?;
+    let trans_id2 = c.read_u64::<NetworkEndian>()?;
+
+    if trans_id1 != 0 {
+        return Err(Error::new(ErrorKind::InvalidData, "Invalid transaction ID!"));
+    }
+
+    let res = match msg_type {
+        BINDING_RESPONSE => StunCodec::read_binding_response(msg, &mut c).map(|r| Response::Bind(r)),
+        BINDING_ERROR => unimplemented!(),
+        SHARED_SECRET_RESPONSE => unimplemented!(),
+        SHARED_SECRET_ERROR => unimplemented!(),
+        _ => return Err(Error::new(ErrorKind::InvalidData, "Unknown message type!")),
+    };
+
+    res.map(|v| (trans_id2, v))
+}
+
 impl UdpCodec for StunCodec {
     type In = (u64, Response);
-    type Out = (u64, SocketAddr, Request);
+    type Out = (SocketAddr, u64, Request);
 
-    fn decode(&mut self, _: &SocketAddr, msg: &[u8]) -> Result<Self::In> {
-        let mut c = Cursor::new(msg);
-
-        let msg_type = c.read_u16::<NetworkEndian>()?;
-        let _ = c.read_u16::<NetworkEndian>()?; // msg_len
-        let trans_id1 = c.read_u64::<NetworkEndian>()?;
-        let trans_id2 = c.read_u64::<NetworkEndian>()?;
-
-        if trans_id1 != 0 {
-            return Err(Error::new(ErrorKind::InvalidData, "Invalid transaction ID!"));
-        }
-
-        let res = match msg_type {
-            BINDING_RESPONSE => Self::read_binding_response(msg, &mut c).map(|r| Response::Bind(r)),
-            BINDING_ERROR => unimplemented!(),
-            SHARED_SECRET_RESPONSE => unimplemented!(),
-            SHARED_SECRET_ERROR => unimplemented!(),
-            _ => return Err(Error::new(ErrorKind::InvalidData, "Unknown message type!")),
-        };
-
-        res.map(|v| (trans_id2, v))
+    fn decode(&mut self, _src: &SocketAddr, msg: &[u8]) -> Result<Self::In> {
+        decode(msg)
     }
 
     fn encode(&mut self, msg: Self::Out, buf: &mut Vec<u8>) -> SocketAddr {
-        let (trans_id, dst, req) = msg;
-
-        let (typ, m) = match req {
-            Request::Bind(bind) => (BINDING_REQUEST, bind.encode().unwrap()),
-            _ => unimplemented!(),
-        };
-
-        buf.write_u16::<NetworkEndian>(typ).unwrap();
-//        buf.write_u16::<NetworkEndian>(m.len() as u16 + 24).unwrap();
-        buf.write_u16::<NetworkEndian>(m.len() as u16).unwrap();
-        buf.write_u64::<NetworkEndian>(0x0).unwrap();
-        buf.write_u64::<NetworkEndian>(trans_id).unwrap();
-        buf.write_all(&m[..]).unwrap();
-
-        /*
-            TODO
-        let mut copy = buf.clone();
-        while copy.len() % 64 != 0 {
-            copy.write_u8(0).unwrap();
-        }
-        println!("{}", copy.len());
-
-        let mut hash = [0; 20];
-        let digest = digest::digest(&digest::SHA1, &copy[..]);
-        hash.copy_from_slice(digest.as_ref());
-        let message_integrity = Attribute::MessageIntegrity(hash);
-        message_integrity.encode(buf).unwrap();
-            */
-
-        dst
+        encode(msg, buf)
     }
 }
 
@@ -354,13 +371,13 @@ mod tests {
     fn encode_binding_request() {
         let req = BindRequest {
             response_address: None,
-            change_request: Some(ChangeRequest::IpAndPort),
+            change_request: ChangeRequest::IpAndPort,
             username: Some(b"foo".to_vec()),
         };
 
         let addr = "0.0.0.0:0".parse().unwrap();
         let mut actual = Vec::new();
-        let _ = StunCodec.encode((0x123456789, addr, Request::Bind(req)), &mut actual); // dst
+        let _ = StunCodec.encode((addr, 0x123456789, Request::Bind(req)), &mut actual); // dst
 
         // TODO: sha1
         let expected = vec![
