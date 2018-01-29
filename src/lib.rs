@@ -6,6 +6,8 @@ extern crate ring;
 extern crate tokio_core;
 extern crate tokio_timer;
 extern crate futures_await;
+#[macro_use] extern crate log;
+extern crate env_logger;
 
 pub mod codec;
 
@@ -80,7 +82,6 @@ pub fn connectivity<B,S>(
     where B: ToSocketAddrs + 'static,
           S: ToSocketAddrs + 'static,
 {
-
     let bind_addr = bind_addr.to_socket_addrs().unwrap().next().unwrap();
     let stun_server = stun_server.to_socket_addrs().unwrap().next().unwrap();
 
@@ -91,31 +92,39 @@ pub fn connectivity<B,S>(
         let public_ip = public_addr.ip();
 
         if bind_addr.ip() == public_ip {
-            // No NAT
+            debug!("No NAT. Public IP ({}) == Bind IP ({})", bind_addr.ip(), public_ip);
             let (io, resp) = await!(change_request(io, stun_server, timeout, ChangeRequest::IpAndPort))?;
             if resp.is_some() {
+                info!("OpenInternet: {}", public_addr);
                 return Ok((io, Connectivity::OpenInternet(public_addr)));
             } else {
+                info!("SymmetricFirewall: {}", public_addr);
                 return Ok((io, Connectivity::SymmetricFirewall(public_addr)));
             }
         }
+        debug!("Public IP ({}) != Bind IP ({})", bind_addr.ip(), public_ip);
 
         // NAT detected
-        let (io, resp) = await!(change_request(io, stun_server, timeout, ChangeRequest::None))?;
+        let (io, resp) = await!(change_request(io, stun_server, timeout, ChangeRequest::IpAndPort))?;
         if resp.is_some() {
+            info!("FullConeNat: {}", public_addr);
             return Ok((io, Connectivity::FullConeNat(public_addr)));
         }
 
+        debug!("No respone from different IP and Port");
         let (io, resp) = await!(change_request(io, stun_server, timeout, ChangeRequest::Port))?;
         if let Some(Response::Bind(resp)) = resp {
             if resp.mapped_address.ip() != public_ip {
+                info!("SymmetricNat");
                 return Ok((io, Connectivity::SymmetricNat));
             }
 
             let (io, resp) = await!(change_request(io, stun_server, timeout, ChangeRequest::Port))?;
             if resp.is_some() {
+                info!("RestrictedConeNat: {}", public_addr);
                 Ok((io, Connectivity::RestrictedConeNat(public_addr)))
             } else {
+                info!("RestrictedPortNat: {}", public_addr);
                 Ok((io, Connectivity::RestrictedPortNat(public_addr)))
             }
         } else {
@@ -123,7 +132,6 @@ pub fn connectivity<B,S>(
             Err((io, Error::new(ErrorKind::InvalidData, msg)))
         }
     } else {
-        println!("last");
         Err((io, Error::from_raw_os_error(NETWORK_UNREACHABLE)))
     }
 }
