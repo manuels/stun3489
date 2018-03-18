@@ -1,17 +1,20 @@
 [package]
 name = "stun3489"
-version = "0.4.2"
+version = "0.4.3"
 authors = ["Manuel Schölling <manuel.schoelling@gmx.de>"]
 homepage = "https://github.com/manuels/stun3489"
 description = "An implementation of STUN (RFC 3489) using tokio"
 license = "GPL-2.0"
+edition = "2018"
+documentation = "https://docs.rs/stun3489"
+repository = "https://github.com/manuels/stun3489"
 
 [dependencies]
-byteorder = "1.0.0"
-futures-await = "0.1.0"
-tokio-core = "0.1.8"
-tokio-timer = "0.1.2"
+byteorder = "1.2.7"
+tokio = {version = "0.1", features = ["async-await-preview"]}
+futures = "0.1.25"
 ring = "0.11.0"
-rand = "0.3.15"
-log = "0.4.1"
-env_logger = "0.5.3"
+rand = "0.6.1"
+log = "0.4.6"
+env_logger = "0.6.0"
+bytes = "0.4.11"

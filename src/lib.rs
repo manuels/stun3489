@@ -1,32 +1,42 @@
-#![feature(conservative_impl_trait, generators, proc_macro, nll)]
+#![feature(pin)]
+#![feature(await_macro, async_await, futures_api)]
 
 extern crate byteorder;
 extern crate rand;
 extern crate ring;
-extern crate tokio_core;
-extern crate tokio_timer;
-extern crate futures_await;
+extern crate futures;
 #[macro_use] extern crate log;
 extern crate env_logger;
+extern crate bytes;
 
 pub mod codec;
+pub use crate::codec::StunCodec;
 
 use std::io::Error;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
-use std::net::ToSocketAddrs;
 
 use rand::Rng;
+use rand::FromEntropy;
+use rand::rngs::SmallRng;
 
-use futures_await as futures;
-use futures::prelude::*;
+use tokio::prelude::*;
 
-use codec::Request;
-use codec::Response;
-use codec::BindRequest;
-use codec::ChangeRequest;
+use crate::codec::Request;
+use crate::codec::Response;
+use crate::codec::BindRequest;
+use crate::codec::ChangeRequest;
 
 pub const NETWORK_UNREACHABLE:i32 = 101;
+
+pub struct Stun3489<I, O>
+where I: Stream<Item=((u64, Response), SocketAddr), Error=std::io::Error>,
+      O: Sink<SinkItem=((u64, Request), SocketAddr), SinkError=std::io::Error>
+{
+    rng: SmallRng,
+    stream: I,
+    sink: O,
+}
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum Connectivity {
@@ -51,163 +61,135 @@ impl Into<Option<SocketAddr>> for Connectivity {
     }
 }
 
-type O = Box<Sink<SinkItem=(SocketAddr, u64, Request), SinkError=std::io::Error>>;
-type I = Box<Stream<Item=(u64, Response), Error=std::io::Error>>;
-
-pub fn codec<II,OO>(sink: OO, stream: II)
-    -> (O, I)
-    where OO: Sink<SinkItem=(SocketAddr, Vec<u8>), SinkError=std::io::Error> + 'static,
-          II: Stream<Item=(SocketAddr, Vec<u8>), Error=std::io::Error> + 'static,
+impl<I, O> Stun3489<I, O>
+where I: Stream<Item=((u64, Response), SocketAddr), Error=std::io::Error> + std::marker::Unpin,
+      O: Sink<SinkItem=((u64, Request), SocketAddr), SinkError=std::io::Error> + std::marker::Unpin
 {
-    let stream = stream.filter_map(|(_src, msg)| codec::decode(&msg).ok());
-    let sink = sink.with(|info| {
-        let mut data = vec![];
-        let dst = codec::encode(info, &mut data);
-        Ok((dst, data))
-    });
-
-    (Box::new(sink), Box::new(stream))
-}
-
-/// `stream` should be a tokio_timer::TimeoutStream
-#[async]
-pub fn connectivity<B,S>(
-        sink: O,
-        stream: I,
-        bind_addr: B,
-        stun_server: S)
-    -> Result<((O, I), Connectivity), ((O, I), std::io::Error)>
-    where B: ToSocketAddrs + 'static,
-          S: ToSocketAddrs + 'static,
-{
-    let bind_addr = bind_addr.to_socket_addrs().unwrap().next().unwrap();
-    let stun_server = stun_server.to_socket_addrs().unwrap().next().unwrap();
-
-    let io = (sink, stream);
-    let (io, resp) = await!(change_request(io, stun_server, ChangeRequest::None))?;
-    if let Some(Response::Bind(resp)) = resp {
-        let public_addr = resp.mapped_address;
-        let public_ip = public_addr.ip();
-
-        if bind_addr.ip() == public_ip {
-            debug!("No NAT. Public IP ({}) == Bind IP ({})", bind_addr.ip(), public_ip);
-            let (io, resp) = await!(change_request(io, stun_server, ChangeRequest::IpAndPort))?;
-            if resp.is_some() {
-                info!("OpenInternet: {}", public_addr);
-                return Ok((io, Connectivity::OpenInternet(public_addr)));
-            } else {
-                info!("SymmetricFirewall: {}", public_addr);
-                return Ok((io, Connectivity::SymmetricFirewall(public_addr)));
-            }
+    /// `stream` should be a tokio_timer::TimeoutStream
+    pub fn new(sink: O, stream: I) -> Stun3489<I, O> {
+        Stun3489 {
+            rng: SmallRng::from_entropy(),
+            sink, stream
         }
-        debug!("Public IP ({}) != Bind IP ({})", bind_addr.ip(), public_ip);
+    }
 
-        // NAT detected
-        let (io, resp) = await!(change_request(io, stun_server, ChangeRequest::IpAndPort))?;
-        if resp.is_some() {
-            info!("FullConeNat: {}", public_addr);
-            return Ok((io, Connectivity::FullConeNat(public_addr)));
-        }
+    pub fn into_inner(self) -> (O, I) {
+        (self.sink, self.stream)
+    }
 
-        debug!("No respone from different IP and Port");
-        let (io, resp) = await!(change_request(io, stun_server, ChangeRequest::Port))?;
+    pub async fn check(&mut self,
+            bind_addr: SocketAddr,
+            stun_server: SocketAddr)
+        -> Result<Connectivity, std::io::Error>
+    {
+        let resp = await!(self.change_request(stun_server, ChangeRequest::None))?;
         if let Some(Response::Bind(resp)) = resp {
-            if resp.mapped_address.ip() != public_ip {
-                info!("SymmetricNat");
-                return Ok((io, Connectivity::SymmetricNat));
+            let public_addr = resp.mapped_address;
+            let public_ip = public_addr.ip();
+
+            if bind_addr.ip() == public_ip {
+                debug!("No NAT. Public IP ({}) == Bind IP ({})", bind_addr.ip(), public_ip);
+                let resp = await!(self.change_request(stun_server, ChangeRequest::IpAndPort))?;
+                if resp.is_some() {
+                    info!("OpenInternet: {}", public_addr);
+                    return Ok(Connectivity::OpenInternet(public_addr));
+                } else {
+                    info!("SymmetricFirewall: {}", public_addr);
+                    return Ok(Connectivity::SymmetricFirewall(public_addr));
+                }
+            }
+            debug!("Public IP ({}) != Bind IP ({})", bind_addr.ip(), public_ip);
+
+            // NAT detected
+            let resp = await!(self.change_request(stun_server, ChangeRequest::IpAndPort))?;
+            if resp.is_some() {
+                info!("FullConeNat: {}", public_addr);
+                return Ok(Connectivity::FullConeNat(public_addr));
             }
 
-            let (io, resp) = await!(change_request(io, stun_server, ChangeRequest::Port))?;
-            if resp.is_some() {
-                info!("RestrictedConeNat: {}", public_addr);
-                Ok((io, Connectivity::RestrictedConeNat(public_addr)))
+            debug!("No respone from different IP and Port");
+            let resp = await!(self.change_request(stun_server, ChangeRequest::Port))?;
+            if let Some(Response::Bind(resp)) = resp {
+                if resp.mapped_address.ip() != public_ip {
+                    info!("SymmetricNat");
+                    return Ok(Connectivity::SymmetricNat);
+                }
+
+                let resp = await!(self.change_request(stun_server, ChangeRequest::Port))?;
+                if resp.is_some() {
+                    info!("RestrictedConeNat: {}", public_addr);
+                    Ok(Connectivity::RestrictedConeNat(public_addr))
+                } else {
+                    info!("RestrictedPortNat: {}", public_addr);
+                    Ok(Connectivity::RestrictedPortNat(public_addr))
+                }
             } else {
-                info!("RestrictedPortNat: {}", public_addr);
-                Ok((io, Connectivity::RestrictedPortNat(public_addr)))
+                let msg = format!("Expected Some(BindResponse) but got {:?} instead!", resp);
+                Err(Error::new(ErrorKind::InvalidData, msg))
             }
         } else {
-            let msg = format!("Expected Some(BindResponse) but got {:?} instead!", resp);
-            Err((io, Error::new(ErrorKind::InvalidData, msg)))
+            Err(Error::from_raw_os_error(NETWORK_UNREACHABLE))
         }
-    } else {
-        Err((io, Error::from_raw_os_error(NETWORK_UNREACHABLE)))
     }
-}
 
-#[async]
-fn change_request(io: (O, I), stun_server: SocketAddr, req: ChangeRequest)
-    -> Result<((O, I), Option<Response>), ((O, I), std::io::Error)>
-{
-    let req = codec::Request::Bind(BindRequest {
-        change_request: req,
-        ..BindRequest::default()
-    });
+    async fn change_request(&mut self, stun_server: SocketAddr, req: ChangeRequest)
+        -> Result<Option<Response>, std::io::Error>
+    {
+        let req = codec::Request::Bind(BindRequest {
+            change_request: req,
+            ..Default::default()
+        });
 
-    await!(send_request(io, stun_server, req))
-}
+        await!(self.send_request(stun_server, req))
+    }
 
-#[async]
-fn send_request(io: (O, I), stun_server: SocketAddr, req: Request)
-    -> Result<((O, I), Option<Response>), ((O, I), std::io::Error)>
-{
-    let (mut sink, mut stream) = io;
+    async fn send_request(&mut self, stun_server: SocketAddr, req: Request)
+        -> Result<Option<Response>, std::io::Error>
+    {
+        let id: u64 = self.rng.gen();
 
-    let mut rng = rand::thread_rng();
-    let id: u64 = rng.gen();
+        await!(self.sink.send_async(((id, req), stun_server)))?;
 
-    let sink = match await!(sink.send((stun_server, id, req))) {
-        Ok(sink) => sink,
-        Err(_) => unimplemented!(), // TODO
-    };
-
-    let stream = stream.skip_while(move |&(actual_id, ref _resp)| Ok(actual_id != id) );
-
-    match await!(stream.into_future()) {
-        Ok((Some((_id, resp)), t)) => {
-            let stream = Box::new(t);
-            Ok(((sink, stream), Some(resp)))
-        },
-        Ok((None, t)) => {
-            let stream = Box::new(t);
-            Ok(((sink, stream), None))
-        },
-        Err((e, t)) => {
-            debug!("Err = {:?}", e);
-            let stream = Box::new(t);
-
-            if e.kind() == std::io::ErrorKind::TimedOut {
-                Ok(((sink, stream), None))
-            } else {
-                Err(((sink, stream), e))
-            }
+        while let Some(res) = await!(self.stream.next()) {
+            match res {
+                Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => return Ok(None),
+                Err(e) => return Err(e),
+                Ok(((actual_id, resp), _src)) => {
+                    if actual_id == id {
+                        return Ok(Some(resp));
+                    }
+                }
+            };
         }
+
+        Ok(None)
     }
 }
 
 #[test]
 fn test_connectivity() {
-    use tokio_core::reactor::Core;
-    use tokio_core::net::UdpSocket;
     use std::time::Duration;
-    use tokio_timer::Timer;
+    use std::net::ToSocketAddrs;
 
-    use codec::StunCodec;
+    use tokio::net::UdpSocket;
+    use tokio::net::UdpFramed;
 
-    let bind_addr = SocketAddr::from(([0, 0, 0, 0], 0));
-    let server = SocketAddr::from(([158,69,26,138], 3478)); // stun.wtfismyip.com
+    tokio::run_async(async {
+        let bind_addr = SocketAddr::from(([0, 0, 0, 0], 0));
+        let sock = UdpSocket::bind(&bind_addr).unwrap();
+        let (sink, stream) = UdpFramed::new(sock, StunCodec).split();
 
-    let mut core = Core::new().unwrap();
-    let handle = core.handle();
+        let stream = stream.timeout(Duration::from_secs(1));
+        let stream = stream.map_err(|e| e.into_inner().unwrap_or_else(||
+            Error::new(ErrorKind::TimedOut, ""))
+        );
 
-    let sock = UdpSocket::bind(&bind_addr, &handle).unwrap();
-    let (sink, stream) = sock.framed(StunCodec).split();
+        let mut stun = crate::Stun3489::new(sink, stream);
 
-    let stream = Timer::default().timeout_stream(stream, Duration::from_secs(1));
-    let job = connectivity(Box::new(sink), Box::new(stream), bind_addr,
-        server);
+        let mut addrs_iter = "stun.wtfismyip.com:3478".to_socket_addrs().unwrap();
+        let server = addrs_iter.next().unwrap();
 
-    match core.run(job) {
-        Ok((_, _conn)) => (),
-        Err((_, e)) => Err(e).unwrap()
-    }
+        let job = stun.check(bind_addr, server);
+        println!("{:?}", await!(job));
+    })
 }

@@ -17,7 +17,10 @@ use byteorder::WriteBytesExt;
 use byteorder::NetworkEndian;
 use ring::constant_time::verify_slices_are_equal;
 use ring::digest;
-use tokio_core::net::UdpCodec;
+use tokio::codec::Encoder;
+use tokio::codec::Decoder;
+use bytes::BytesMut;
+use bytes::BufMut;
 
 #[derive(Debug, Clone)]
 pub enum Request {
@@ -83,6 +86,7 @@ pub struct BindResponse {
     pub reflected_from: Option<SocketAddr>,
 }
 
+#[derive(Default)]
 pub struct StunCodec;
 
 pub enum Attribute {
@@ -99,7 +103,7 @@ pub enum Attribute {
 
 impl StunCodec {
     pub fn new() -> StunCodec {
-        StunCodec {}
+        StunCodec
     }
 
     fn read_binding_response(msg: &[u8], c: &mut Cursor<&[u8]>) -> Result<BindResponse> {
@@ -109,37 +113,35 @@ impl StunCodec {
         let mut message_integrity = None;
         let mut reflected_from = None;
 
-        let error = |reason| Err(Error::new(ErrorKind::InvalidData, reason));
+        let error = |reason| Error::new(ErrorKind::InvalidData, reason);
 
         loop {
             let attr = Attribute::read(c);
             match attr {
-                Ok(Attribute::MappedAddress(s))  if mapped_address.is_none()  => mapped_address = Some(s),
-                Ok(Attribute::SourceAddress(s))  if source_address.is_none()  => source_address = Some(s),
-                Ok(Attribute::ChangedAddress(s)) if changed_address.is_none() => changed_address = Some(s),
-                Ok(Attribute::ReflectedFrom(s))  if reflected_from.is_none()  => reflected_from = Some(s),
-                Ok(Attribute::MessageIntegrity(h)) if message_integrity.is_none() => {
-                    message_integrity = Some(h)
-                },
+                Ok(Attribute::MappedAddress(s))  => { mapped_address.get_or_insert(s); },
+                Ok(Attribute::SourceAddress(s))  => { source_address.get_or_insert(s); },
+                Ok(Attribute::ChangedAddress(s)) => { changed_address.get_or_insert(s); },
+                Ok(Attribute::ReflectedFrom(s))  => { reflected_from.get_or_insert(s); },
+                Ok(Attribute::MessageIntegrity(s)) => { message_integrity.get_or_insert(s); },
                 Ok(Attribute::UnknownOptional) => continue,
                 Err(ref e) if e.kind() == ErrorKind::UnexpectedEof => break,
-                _ => return error("Unknown mandatory attribute!"),
-            }
+                _ => return Err(error("Unknown mandatory attribute!")),
+            };
         }
 
         if let Some(expected) = message_integrity {
             let actual = digest::digest(&digest::SHA1, &msg[..msg.len() - 24]);
 
             if verify_slices_are_equal(actual.as_ref(), &expected).is_err() {
-                return error("Message integrity violated!");
+                return Err(error("Message integrity violated!"));
             }
         }
 
         Ok(BindResponse {
-            mapped_address:  if let Some(a) = mapped_address { a } else { return error("MappedAddress missing!") },
-            source_address:  if let Some(a) = source_address { a } else { return error("SourceAddress missing!") },
-            changed_address: if let Some(a) = changed_address { a } else { return error("ChangedAddress missing!") },
-            reflected_from:  reflected_from,
+            mapped_address:  mapped_address.ok_or_else(|| error("MappedAddress missing!"))?,
+            source_address:  source_address.ok_or_else(|| error("SourceAddress missing!"))?,
+            changed_address:  changed_address.ok_or_else(|| error("ChangedAddress missing!"))?,
+            reflected_from,
         })
     }
 }
@@ -170,14 +172,14 @@ impl Attribute {
             },
             _ if typ <= 0x7fff => Err(Error::new(ErrorKind::InvalidData, "Unknown mandatory field")),
             _ => {
-                c.seek(SeekFrom::Current(len as i64))?;
+                c.seek(SeekFrom::Current(i64::from(len)))?;
                 Ok(Attribute::UnknownOptional)
             },
         }
     }
 
     fn read_address(c: &mut Cursor<&[u8]>) -> Result<SocketAddr> {
-        let _ = c.read_u8()?; // ignored
+        let _ = c.read_u8()?;
         let typ = c.read_u8()?;
         let port = c.read_u16::<NetworkEndian>()?;
         let addr = c.read_u32::<NetworkEndian>()?;
@@ -186,10 +188,10 @@ impl Attribute {
             return Err(Error::new(ErrorKind::InvalidData, "Invalid address family"));
         }
 
-        let b0 = ((addr & 0xff000000) >> 24) as u8;
-        let b1 = ((addr & 0x00ff0000) >> 16) as u8;
-        let b2 = ((addr & 0x0000ff00) >>  8) as u8;
-        let b3 = ((addr & 0x000000ff) >>  0) as u8;
+        let b0 = ((addr & 0xff00_0000) >> 24) as u8;
+        let b1 = ((addr & 0x00ff_0000) >> 16) as u8;
+        let b2 = ((addr & 0x0000_ff00) >>  8) as u8;
+        let b3 = ( addr & 0x0000_00ff       ) as u8;
         let ip = IpAddr::V4(Ipv4Addr::new(b0, b1, b2, b3));
 
         Ok(SocketAddr::new(ip, port))
@@ -279,72 +281,70 @@ const CHANGE_REQUEST_IP:u32          = 0x20;
 const CHANGE_REQUEST_PORT:u32        = 0x40;
 const CHANGE_REQUEST_IP_AND_PORT:u32 = 0x60;
 
-pub fn encode(msg: (SocketAddr, u64, Request), buf: &mut Vec<u8>) -> SocketAddr {
-    let (dst, trans_id, req) = msg;
+impl Encoder for StunCodec {
+    type Item = (u64, Request);
+    type Error = Error;
 
-    let (typ, m) = match req {
-        Request::Bind(bind) => (BINDING_REQUEST, bind.encode().unwrap()),
-        _ => unimplemented!(),
-    };
+    fn encode(&mut self, msg: Self::Item, buf: &mut BytesMut) -> Result<()> {
+        let (trans_id, req) = msg;
 
-    buf.write_u16::<NetworkEndian>(typ).unwrap();
-//        buf.write_u16::<NetworkEndian>(m.len() as u16 + 24).unwrap();
-    buf.write_u16::<NetworkEndian>(m.len() as u16).unwrap();
-    buf.write_u64::<NetworkEndian>(0x0).unwrap();
-    buf.write_u64::<NetworkEndian>(trans_id).unwrap();
-    buf.write_all(&m[..]).unwrap();
+        let (typ, m) = match req {
+            Request::Bind(bind) => (BINDING_REQUEST, bind.encode()?),
+            _ => unimplemented!(),
+        };
 
-    /*
-        TODO
-    let mut copy = buf.clone();
-    while copy.len() % 64 != 0 {
-        copy.write_u8(0).unwrap();
-    }
-    println!("{}", copy.len());
+        buf.put_u16_be(typ);
+        // buf.write_u16::<NetworkEndian>(m.len() as u16 + 24).unwrap();
+        buf.put_u16_be(m.len() as u16);
+        buf.put_u64_be(0);
+        buf.put_u64_be(trans_id);
+        buf.put_slice(&m);
 
-    let mut hash = [0; 20];
-    let digest = digest::digest(&digest::SHA1, &copy[..]);
-    hash.copy_from_slice(digest.as_ref());
-    let message_integrity = Attribute::MessageIntegrity(hash);
-    message_integrity.encode(buf).unwrap();
+        Ok(())
+        /*
+        TODO sha1
+
+        let mut copy = buf.clone();
+        while copy.len() % 64 != 0 {
+            copy.write_u8(0).unwrap();
+        }
+        println!("{}", copy.len());
+
+        let mut hash = [0; 20];
+        let digest = digest::digest(&digest::SHA1, &copy[..]);
+        hash.copy_from_slice(digest.as_ref());
+        let message_integrity = Attribute::MessageIntegrity(hash);
+        message_integrity.encode(buf).unwrap();
         */
-
-    dst
+    }
 }
 
-pub fn decode(msg: &[u8]) -> Result<(u64, Response)> {
-    let mut c = Cursor::new(msg);
+impl Decoder for StunCodec {
+    type Item = (u64, Response);
+    type Error = Error;
 
-    let msg_type = c.read_u16::<NetworkEndian>()?;
-    let _ = c.read_u16::<NetworkEndian>()?; // msg_len
-    let trans_id1 = c.read_u64::<NetworkEndian>()?;
-    let trans_id2 = c.read_u64::<NetworkEndian>()?;
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>> {
+        let msg = &src[..];
+        let mut c = Cursor::new(msg);
 
-    if trans_id1 != 0 {
-        return Err(Error::new(ErrorKind::InvalidData, "Invalid transaction ID!"));
-    }
+        let msg_type = c.read_u16::<NetworkEndian>()?;
+        let _msg_len = c.read_u16::<NetworkEndian>()?;
+        let trans_id1 = c.read_u64::<NetworkEndian>()?;
+        let trans_id2 = c.read_u64::<NetworkEndian>()?;
 
-    let res = match msg_type {
-        BINDING_RESPONSE => StunCodec::read_binding_response(msg, &mut c).map(|r| Response::Bind(r)),
-        BINDING_ERROR => unimplemented!(),
-        SHARED_SECRET_RESPONSE => unimplemented!(),
-        SHARED_SECRET_ERROR => unimplemented!(),
-        _ => return Err(Error::new(ErrorKind::InvalidData, "Unknown message type!")),
-    };
+        if trans_id1 != 0 {
+            return Err(Error::new(ErrorKind::InvalidData, "Invalid transaction ID!"));
+        }
 
-    res.map(|v| (trans_id2, v))
-}
+        let res = match msg_type {
+            BINDING_RESPONSE => StunCodec::read_binding_response(msg, &mut c).map(Response::Bind),
+            BINDING_ERROR => Err(Error::new(ErrorKind::InvalidData, "BINDING_ERROR unimplemented")),
+            SHARED_SECRET_RESPONSE => Err(Error::new(ErrorKind::InvalidData, "SHARED_SECRET_RESPONSE unimplemented")),
+            SHARED_SECRET_ERROR => Err(Error::new(ErrorKind::InvalidData, "SHARED_SECRET_ERROR unimplemented")),
+            _ => return Err(Error::new(ErrorKind::InvalidData, "Unknown message type!")),
+        };
 
-impl UdpCodec for StunCodec {
-    type In = (u64, Response);
-    type Out = (SocketAddr, u64, Request);
-
-    fn decode(&mut self, _src: &SocketAddr, msg: &[u8]) -> Result<Self::In> {
-        decode(msg)
-    }
-
-    fn encode(&mut self, msg: Self::Out, buf: &mut Vec<u8>) -> SocketAddr {
-        encode(msg, buf)
+        res.map(|v| Some((trans_id2, v)))
     }
 }
 
@@ -375,9 +375,8 @@ mod tests {
             username: Some(b"foo".to_vec()),
         };
 
-        let addr = "0.0.0.0:0".parse().unwrap();
-        let mut actual = Vec::new();
-        let _ = StunCodec.encode((addr, 0x123456789, Request::Bind(req)), &mut actual); // dst
+        let mut actual = BytesMut::with_capacity(1024);
+        let _ = StunCodec.encode((0x123456789, Request::Bind(req)), &mut actual); // dst
 
         // TODO: sha1
         let expected = vec![
