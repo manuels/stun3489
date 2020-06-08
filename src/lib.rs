@@ -1,12 +1,3 @@
-extern crate byteorder;
-extern crate futures;
-extern crate rand;
-//extern crate ring;
-#[macro_use]
-extern crate log;
-extern crate bytes;
-extern crate env_logger;
-
 pub mod codec;
 
 pub use crate::codec::StunCodec;
@@ -15,8 +6,9 @@ use std::io::Error;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 
+use log::{debug, info};
+use rand::SeedableRng;
 use rand::rngs::SmallRng;
-use rand::FromEntropy;
 use rand::Rng;
 
 use futures::prelude::*;

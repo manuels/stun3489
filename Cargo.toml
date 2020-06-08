@@ -10,11 +10,13 @@ documentation = "https://docs.rs/stun3489"
 repository = "https://github.com/manuels/stun3489"
 
 [dependencies]
-byteorder = "1.2.7"
-futures = "0.3.4"
-async-std = {version = "1.4.0", features = ["unstable"]}
-rand = "0.6.1"
-log = "0.4.6"
-env_logger = "0.7.1"
-bytes = "0.5.4"
-nix = "0.17.0"
+byteorder = "1.2"
+bytes = "0.5"
+futures = "0.3"
+log = "0.4"
+rand = { version = "0.7", features = ["small_rng"] }
+
+[dev-dependencies]
+async-std = { version = "1.4", features = ["unstable"] }
+env_logger = "0.7"
+nix = "0.17"

@@ -323,7 +323,7 @@ impl Attribute {
                 }
                 assert_eq!(buf.len(), total_len);
 
-                (USERNAME, buf.clone())
+                (USERNAME, buf)
             }
             Attribute::ChangeRequest(ref c) => (CHANGE_REQUEST, Self::encode_change_request(c)?),
             Attribute::UnknownOptional => unreachable!(),
